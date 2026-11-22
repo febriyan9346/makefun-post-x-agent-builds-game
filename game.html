@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Meteor Dodge — built from one prompt</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0b0714; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; font-family: system-ui, sans-serif; }
+  #wrap { position: relative; width: min(100vw, 56.25vh); aspect-ratio: 9 / 16; }
+  canvas { width: 100%; height: 100%; display: block; background: #0b0714; touch-action: none; }
+  #hud { position: absolute; top: 0; left: 0; right: 0; display: flex; justify-content: space-between;
+         padding: 14px 18px; color: #fff; font-weight: 800; font-size: 20px;
+         text-shadow: 0 2px 8px #000; pointer-events: none; }
+  #overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+             justify-content: center; text-align: center; color: #fff; background: rgba(11,7,20,.72); }
+  #overlay h1 { margin: 0 0 8px; font-size: 44px; letter-spacing: 2px; color: #ff2e7e; }
+  #overlay p { margin: 6px 0; font-size: 18px; line-height: 1.5; max-width: 80%; }
+  #overlay button { margin-top: 18px; padding: 14px 34px; font-size: 20px; font-weight: 800;
+                    color: #191419; background: #ff2e7e; border: 0; border-radius: 999px; cursor: pointer; }
+  #overlay .tiny { font-size: 13px; opacity: .75; margin-top: 14px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="540" height="960"></canvas>
+  <div id="hud"><span id="score">SCORE 0</span><span id="lives">❤❤❤</span><span id="time">60</span></div>
+  <div id="overlay">
+    <h1>METEOR DODGE</h1>
+    <p>Dodge the falling meteors.<br>Survive 60 seconds. 3 lives.<br>+10 per second &middot; +5 per near-miss.</p>
+    <p>← → or drag to steer the rocket.</p>
+    <button id="startBtn">▶ PLAY</button>
+    <p class="tiny">Built from one prompt by an AI agent for make.fun</p>
+  </div>
+</div>
+<script>
+'use strict';
+// METEOR DODGE — a tiny browser game built from one prompt:
+// "Build me a tiny browser game: a rocket dodging falling meteors.
+//  60 seconds, 3 lives, score for every second survived. Neon, fast, fun."
+// Rules: rocket steers left/right; meteors fall faster over time; +10 score
+// per second survived, +5 per near-miss; a hit costs 1 life + 1.5s shield;
+// 0 lives = game over; surviving 60s = win.
+const W = 540, H = 960;
+const ROCKET_Y = H - 140, ROCKET_W = 46, ROCKET_H = 64, ROCKET_SPEED = 520;
+const GAME_SECONDS = 60, START_LIVES = 3, SHIELD_SECONDS = 1.5;
+const SPAWN_START = 0.55, SPAWN_END = 0.28;          // seconds between meteors
+const FALL_START = 260, FALL_GROWTH = 6;             // px/s, +per second elapsed
+const NEAR_MISS_DX = 70, NEAR_MISS_BONUS = 5, SECOND_BONUS = 10;
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const scoreEl = document.getElementById('score');
+const livesEl = document.getElementById('lives');
+const timeEl = document.getElementById('time');
+const overlay = document.getElementById('overlay');
+const startBtn = document.getElementById('startBtn');
+
+let state = 'menu'; // menu | playing | over | win
+let rocketX = W / 2, targetX = W / 2, keys = {};
+let meteors = [], stars = [], score = 0, lives = START_LIVES;
+let elapsed = 0, spawnIn = 0, shield = 0, secondTick = 0, lastTs = 0;
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+function initStars() {
+  stars = [];
+  for (let i = 0; i < 90; i++)
+    stars.push({ x: rand(0, W), y: rand(0, H), r: rand(0.6, 2.2), s: rand(12, 60) });
+}
+function spawnMeteor() {
+  const r = rand(14, 30);
+  meteors.push({ x: rand(r, W - r), y: -r - 10, r,
+                 vy: FALL_START + FALL_GROWTH * elapsed + rand(-30, 60),
+                 vx: rand(-25, 25), rot: rand(0, 6.28), vr: rand(-1.5, 1.5),
+                 scored: false });
+}
+function reset() {
+  rocketX = W / 2; targetX = W / 2; meteors = []; score = 0;
+  lives = START_LIVES; elapsed = 0; spawnIn = 0.4; shield = 0; secondTick = 0;
+  initStars();
+}
+function drawBackground(dt) {
+  ctx.fillStyle = '#0b0714';
+  ctx.fillRect(0, 0, W, H);
+  for (const st of stars) {
+    st.y += st.s * dt; if (st.y > H) { st.y = -2; st.x = rand(0, W); }
+    ctx.globalAlpha = 0.4 + 0.6 * Math.abs(Math.sin(elapsed * 2 + st.x));
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(st.x, st.y, st.r, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function drawRocket() {
+  const blink = shield > 0 && Math.floor(elapsed * 12) % 2 === 0;
+  ctx.save();
+  ctx.translate(rocketX, ROCKET_Y);
+  if (blink) ctx.globalAlpha = 0.35;
+  // flame
+  const fl = 18 + Math.sin(elapsed * 30) * 8;
+  ctx.fillStyle = '#ff9d00';
+  ctx.beginPath(); ctx.moveTo(-10, 30); ctx.lineTo(0, 30 + fl); ctx.lineTo(10, 30); ctx.closePath(); ctx.fill();
+  // body
+  ctx.fillStyle = '#f2f2f2';
+  ctx.beginPath(); ctx.moveTo(0, -32); ctx.quadraticCurveTo(18, -10, 16, 22);
+  ctx.lineTo(-16, 22); ctx.quadraticCurveTo(-18, -10, 0, -32); ctx.fill();
+  ctx.fillStyle = '#ff2e7e';
+  ctx.beginPath(); ctx.arc(0, -4, 8, 0, 6.283); ctx.fill();
+  ctx.fillStyle = '#00e5ff';
+  ctx.beginPath(); ctx.arc(0, -4, 4.5, 0, 6.283); ctx.fill();
+  // fins
+  ctx.fillStyle = '#ff2e7e';
+  ctx.beginPath(); ctx.moveTo(-16, 8); ctx.lineTo(-30, 28); ctx.lineTo(-16, 26); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(16, 8); ctx.lineTo(30, 28); ctx.lineTo(16, 26); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function drawMeteor(m) {
+  ctx.save(); ctx.translate(m.x, m.y); ctx.rotate(m.rot);
+  ctx.fillStyle = '#8a6d4b';
+  ctx.beginPath();
+  for (let i = 0; i < 9; i++) {
+    const a = (i / 9) * 6.283, rr = m.r * (0.78 + 0.22 * Math.sin(i * 2.7));
+    ctx[i ? 'lineTo' : 'moveTo'](Math.cos(a) * rr, Math.sin(a) * rr);
+  }
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = 'rgba(255,120,40,.85)';
+  ctx.beginPath(); ctx.arc(-m.r * 0.3, -m.r * 0.3, m.r * 0.28, 0, 6.283); ctx.fill();
+  ctx.restore();
+}
+function drawHUD() {
+  scoreEl.textContent = 'SCORE ' + score;
+  livesEl.textContent = '❤'.repeat(lives) + '♡'.repeat(START_LIVES - lives);
+  timeEl.textContent = Math.max(0, Math.ceil(GAME_SECONDS - elapsed));
+}
+function endGame(win) {
+  state = win ? 'win' : 'over';
+  overlay.classList.remove('hidden');
+  overlay.innerHTML =
+    '<h1>' + (win ? 'YOU WIN!' : 'GAME OVER') + '</h1>' +
+    '<p>Final score: <b>' + score + '</b><br>Survived ' +
+    Math.floor(elapsed) + 's of 60s.</p>' +
+    '<button id="againBtn">↻ PLAY AGAIN</button>' +
+    '<p class="tiny">Built from one prompt by an AI agent for make.fun</p>';
+  document.getElementById('againBtn').addEventListener('click', startGame);
+}
+function startGame() {
+  reset();
+  overlay.classList.add('hidden');
+  state = 'playing';
+  lastTs = performance.now();
+  requestAnimationFrame(loop);
+}
+function loop(ts) {
+  if (state !== 'playing') return;
+  const dt = Math.min(0.05, (ts - lastTs) / 1000); lastTs = ts;
+  elapsed += dt; shield = Math.max(0, shield - dt);
+  // steering: keys, pointer drag, or autoplay (?demo=1)
+  if (new URLSearchParams(location.search).get('demo') === '1') {
+    let danger = null;
+    for (const m of meteors)
+      if (m.y > ROCKET_Y - 260 && m.y < ROCKET_Y && Math.abs(m.x - rocketX) < 110)
+        if (!danger || m.y > danger.y) danger = m;
+    targetX = danger ? (danger.x > rocketX ? rocketX - 130 : rocketX + 130)
+                     : W / 2 + Math.sin(elapsed * 0.9) * 130;
+  }
+  if (keys.ArrowLeft || keys.a) targetX -= ROCKET_SPEED * dt;
+  if (keys.ArrowRight || keys.d) targetX += ROCKET_SPEED * dt;
+  targetX = Math.max(30, Math.min(W - 30, targetX));
+  rocketX += Math.max(-ROCKET_SPEED * dt, Math.min(ROCKET_SPEED * dt, targetX - rocketX));
+  // spawn
+  spawnIn -= dt;
+  if (spawnIn <= 0) {
+    spawnMeteor();
+    spawnIn = SPAWN_START + (SPAWN_END - SPAWN_START) * (elapsed / GAME_SECONDS);
+  }
+  // score per second
+  secondTick += dt;
+  if (secondTick >= 1) { secondTick -= 1; score += SECOND_BONUS; }
+  // meteors
+  for (let i = meteors.length - 1; i >= 0; i--) {
+    const m = meteors[i];
+    m.y += m.vy * dt; m.x += m.vx * dt; m.rot += m.vr * dt;
+    const dx = Math.abs(m.x - rocketX), dy = Math.abs(m.y - ROCKET_Y);
+    if (!m.scored && m.y > ROCKET_Y + 40) {          // passed safely
+      m.scored = true;
+      if (dx < NEAR_MISS_DX) score += NEAR_MISS_BONUS;
+    }
+    if (shield <= 0 && dx < m.r + 20 && dy < m.r + 26) {
+      lives--; shield = SHIELD_SECONDS; meteors.splice(i, 1);
+      if (lives <= 0) { drawBackground(dt); drawRocket(); drawHUD(); endGame(false); return; }
+      continue;
+    }
+    if (m.y - m.r > H + 20) meteors.splice(i, 1);
+  }
+  drawBackground(dt);
+  for (const m of meteors) drawMeteor(m);
+  drawRocket();
+  drawHUD();
+  if (elapsed >= GAME_SECONDS) { endGame(true); return; }
+  requestAnimationFrame(loop);
+}
+window.addEventListener('keydown', (e) => { keys[e.key] = true; });
+window.addEventListener('keyup', (e) => { keys[e.key] = false; });
+canvas.addEventListener('pointermove', (e) => {
+  const r = canvas.getBoundingClientRect();
+  targetX = (e.clientX - r.left) / r.width * W;
+});
+canvas.addEventListener('pointerdown', (e) => {
+  const r = canvas.getBoundingClientRect();
+  targetX = (e.clientX - r.left) / r.width * W;
+});
+startBtn.addEventListener('click', startGame);
+initStars();
+drawBackground(0); drawRocket(); drawHUD();
+</script>
+</body>
+</html>
